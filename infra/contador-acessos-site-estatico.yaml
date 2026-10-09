@@ -1,0 +1,1323 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Contador de acessos serverless com site estatico em S3. Route 53 + ACM + WAF + CloudFront (site e API no mesmo
+  dominio), API Gateway REST com integracao direta ao SQS, Lambda (Counter Processor e Read Counter), DynamoDB,
+  alarmes (CloudWatch/SNS), CloudTrail e AWS Budgets. Sem VPC, sem EC2, sem ALB, sem NAT.
+
+# =====================================================================================================================
+# IaC - Contador de Acessos Serverless (arquitetura final: site estatico)
+#
+# REGIAO ....: us-east-1 (obrigatorio: Web ACL do WAF com escopo CLOUDFRONT e certificado ACM do CloudFront so existem
+#              em us-east-1; a regra RegionMustBeUsEast1 abaixo impede o deploy em outra regiao).
+# PRE-REQUISITOS: (1) zona hospedada PUBLICA do dominio no Route 53 (informe o HostedZoneId);
+#                 (2) e-mail para alertas; (3) permissoes para criar IAM roles (CAPABILITY_IAM).
+#
+# VALIDAR ...: aws cloudformation validate-template --template-body file://contador-acessos-site-estatico.yaml
+#              cfn-lint contador-acessos-site-estatico.yaml
+#
+# DEPLOY ....: aws cloudformation deploy --region us-east-1 \
+#                --stack-name access-counter-prod \
+#                --template-file contador-acessos-site-estatico.yaml \
+#                --capabilities CAPABILITY_IAM \
+#                --parameter-overrides DomainName=contador.exemplo.com.br HostedZoneId=Z0123456789ABC \
+#                                      AlertEmail=equipe@exemplo.com.br Environment=prod \
+#                --tags Project=access-counter Environment=prod Owner=equipe CostCenter=marketing
+#              (as tags de stack se propagam para todos os recursos que as suportam)
+#
+# POS-DEPLOY : 1) confirmar a assinatura do e-mail enviada pelo SNS;
+#              2) manter WafEnforcementMode=Count por alguns dias, revisar as amostras no WAF e entao mudar para Block;
+#              3) publicar o site real: aws s3 sync ./site s3://<SiteBucketName> --delete
+#                 e aws cloudfront create-invalidation --distribution-id <DistributionId> --paths "/index.html"
+#                 (o recurso SitePublisher so grava uma pagina "Em Breve" de demonstracao);
+#              4) executar o plano de validacao do bypass (saidas ApiDirectUrl e ValidationCommands).
+#
+# OBSERVACOES DE PROJETO
+#  - Chamadas ao endereco execute-api sem a chave retornam 403; o CloudFront injeta x-api-key na origem da API.
+#    A chave e gerada pelo Secrets Manager (custo ~US$ 0,40/mes) e NAO aparece em parametros nem no Git.
+#    Rotacao: gerar novo valor (aws secretsmanager put-secret-value), informar o VersionId novo em
+#    OriginVerifySecretVersionId e atualizar a stack (ApiKey e cabecalho do CloudFront mudam juntos; pode haver
+#    uma janela curta de 403 ate o CloudFront propagar).
+#  - ApiDeployment: o CloudFormation nao reimplanta o stage sozinho quando metodos mudam. Ao alterar recursos ou
+#    metodos da API, renomeie o logical ID ApiDeployment (ex.: ApiDeploymentR2) e ajuste ApiStage.DeploymentId.
+#    (o CDK faz isso automaticamente via hash; aqui e uma etapa manual.)
+#  - Plano de preco fixo do CloudFront (flat-rate): e uma assinatura a parte, nao modelada neste template. Se adotar,
+#    validar as limitacoes do plano (sem politicas de cache proprias e sem grupos de regras gerenciadas no WAF) e
+#    ajustar CountCachePolicy e WebAcl.
+#  - Status: template nao implantado nem testado em conta real; revisar com cfn-lint e validar em ambiente de teste.
+# =====================================================================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Identificacao e padronizacao" }
+        Parameters: [ProjectName, Environment]
+      - Label: { default: "Dominio e entrega (Route 53 / ACM / CloudFront)" }
+        Parameters: [DomainName, HostedZoneId, CloudFrontPriceClass, CountCacheTtlSeconds, PublishPlaceholderSite, SiteVersion]
+      - Label: { default: "Seguranca (WAF e API Gateway)" }
+        Parameters: [WafEnforcementMode, ApiRateLimitPer5Min, ApiThrottleRate, ApiThrottleBurst, ApiStageName, OriginVerifySecretVersionId, EnableApiAccessLogs]
+      - Label: { default: "Processamento (SQS / Lambda)" }
+        Parameters: [ProcessorMaxConcurrency, ProcessorTimeoutSeconds, QueueVisibilityTimeoutSeconds]
+      - Label: { default: "Observabilidade, auditoria e custo" }
+        Parameters: [AlertEmail, MonthlyBudgetUsd, LogRetentionDays, EnableCloudTrail, TrailLogRetentionDays]
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: access-counter
+    AllowedPattern: "^[a-z][a-z0-9-]{2,22}[a-z0-9]$"
+    ConstraintDescription: 4 a 24 caracteres, minusculas, numeros e hifen.
+    Description: Prefixo de nomenclatura de todos os recursos.
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev]
+    Description: Ambiente. Em prod a protecao contra exclusao do DynamoDB fica ligada.
+  DomainName:
+    Type: String
+    AllowedPattern: "^([a-z0-9]([a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,}$"
+    ConstraintDescription: Informe um FQDN em minusculas, por exemplo contador.exemplo.com.br.
+    Description: Dominio publico do site e da API (https://DomainName e https://DomainName/api/*).
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Zona hospedada publica que contem o dominio (usada na validacao DNS do ACM e nos registros Alias).
+  AlertEmail:
+    Type: String
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+    ConstraintDescription: Informe um e-mail valido.
+    Description: Destino dos alarmes e dos alertas de orcamento (a assinatura precisa ser confirmada).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Limite mensal (USD) do AWS Budgets. Alertas em 80% (real) e 100% (previsto). O orcamento cobre a conta inteira.
+  WafEnforcementMode:
+    Type: String
+    Default: Count
+    AllowedValues: [Count, Block]
+    Description: Count apenas registra (use nos primeiros dias para ajustar falsos positivos); Block bloqueia de fato.
+  ApiRateLimitPer5Min:
+    Type: Number
+    Default: 500
+    MinValue: 10
+    MaxValue: 20000000
+    Description: Limite de requisicoes a /api/* por IP a cada 5 minutos no WAF (regra por taxa).
+  ApiThrottleRate:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Throttling do API Gateway (req/s). Como todo o trafego usa a mesma chave, funciona como limite global (disjuntor).
+  ApiThrottleBurst:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: Rajada maxima do throttling do API Gateway.
+  ApiStageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-zA-Z0-9_]{1,32}$"
+    Description: Nome do stage do API Gateway (usado como Origin Path no CloudFront).
+  OriginVerifySecretVersionId:
+    Type: String
+    Default: ""
+    Description: Opcional. VersionId do segredo da chave de origem; informe um novo valor para rotacionar a chave.
+  EnableApiAccessLogs:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Logs de acesso do API Gateway. Pre-requisito - o papel de logs do API Gateway ja deve estar configurado nas configuracoes da conta.
+  CountCacheTtlSeconds:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+    Description: TTL do cache do CloudFront para GET /api/count (defasagem maxima do total exibido).
+  CloudFrontPriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [PriceClass_100, PriceClass_200, PriceClass_All]
+    Description: Classe de preco do CloudFront. PriceClass_100 nao inclui America do Sul; PriceClass_All inclui, com custo maior.
+  PublishPlaceholderSite:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Publica uma pagina "Em Breve" de demonstracao no bucket. Use false quando o site real for publicado por pipeline.
+  SiteVersion:
+    Type: String
+    Default: "1"
+    Description: Altere para republicar a pagina de demonstracao (so tem efeito com PublishPlaceholderSite=true).
+  ProcessorMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 1000
+    Description: Concorrencia maxima do Counter Processor via Event Source Mapping (protege o DynamoDB).
+  ProcessorTimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 3
+    MaxValue: 300
+    Description: Timeout do Lambda Counter Processor.
+  QueueVisibilityTimeoutSeconds:
+    Type: Number
+    Default: 190
+    MinValue: 30
+    Description: Visibility timeout da fila. Regra - no minimo 6 x ProcessorTimeoutSeconds + 5 s da janela de lote.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+    Description: Retencao dos log groups (evita crescimento infinito e custo).
+  EnableCloudTrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Cria uma trilha com destino em S3. Use false se a conta ja tiver trilha organizacional (evita cobranca por copia extra).
+  TrailLogRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 90
+    Description: Dias de retencao dos logs do CloudTrail no S3.
+
+Rules:
+  RegionMustBeUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref "AWS::Region", us-east-1]
+        AssertDescription: Esta stack deve ser criada em us-east-1 (WAF CLOUDFRONT e ACM do CloudFront exigem essa regiao).
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  WafBlock: !Equals [!Ref WafEnforcementMode, Block]
+  CreateTrail: !Equals [!Ref EnableCloudTrail, "true"]
+  PublishPlaceholder: !Equals [!Ref PublishPlaceholderSite, "true"]
+  ApiLogsEnabled: !Equals [!Ref EnableApiAccessLogs, "true"]
+
+Resources:
+  # ===================================================================================================================
+  # 1. DADOS - DynamoDB (Multi-AZ nativo, PITR, protecao contra exclusao)
+  # ===================================================================================================================
+  CounterTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${ProjectName}-${Environment}-access-counter"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  # ===================================================================================================================
+  # 2. FILAS - SQS (Click Buffer Queue + Dead Letter Queue)
+  # ===================================================================================================================
+  ClickDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-click-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  ClickQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-click-buffer"
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ClickDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  ClickQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ClickQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt ClickQueue.Arn
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  ClickDeadLetterQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ClickDeadLetterQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt ClickDeadLetterQueue.Arn
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ===================================================================================================================
+  # 3. LAMBDAS - Counter Processor e Read Counter (ARM64, fora da VPC, logs com retencao)
+  # ===================================================================================================================
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-counter-processor"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReadCounterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-read-counter"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: counter-processor-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !GetAtt ProcessorLogGroup.Arn
+              - Sid: ConsumeClickQueue
+                Effect: Allow
+                Action: ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+                Resource: !GetAtt ClickQueue.Arn
+              - Sid: IncrementCounter
+                Effect: Allow
+                Action: "dynamodb:UpdateItem"
+                Resource: !GetAtt CounterTable.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ReadCounterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: read-counter-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !GetAtt ReadCounterLogGroup.Arn
+              - Sid: ReadCounter
+                Effect: Allow
+                Action: "dynamodb:GetItem"
+                Resource: !GetAtt CounterTable.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProcessorLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-counter-processor"
+      Description: Soma o lote de cliques recebido do SQS e faz um unico UpdateItem ADD no DynamoDB.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: !Ref ProcessorTimeoutSeconds
+      Role: !GetAtt ProcessorRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CounterTable
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+
+          import boto3
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["TABLE_NAME"]
+
+
+          def handler(event, context):
+              records = event.get("Records", [])
+              n = len(records)
+              if n == 0:
+                  return {"batchItemFailures": []}
+              try:
+                  # Incremento atomico: um UpdateItem por lote, sem ler-modificar-gravar.
+                  ddb.update_item(
+                      TableName=TABLE,
+                      Key={"id": {"S": "hits"}},
+                      UpdateExpression="ADD hit_count :n",
+                      ExpressionAttributeValues={":n": {"N": str(n)}},
+                  )
+                  log.info(json.dumps({"processed": n}))
+                  return {"batchItemFailures": []}
+              except Exception:
+                  # ReportBatchItemFailures: devolve o lote para nova tentativa (apos 3 falhas vai para a DLQ).
+                  log.exception("Falha ao atualizar o contador; devolvendo o lote")
+                  return {"batchItemFailures": [{"itemIdentifier": r["messageId"]} for r in records]}
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  ProcessorEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ProcessorFunction
+      EventSourceArn: !GetAtt ClickQueue.Arn
+      BatchSize: 50
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+      ScalingConfig:
+        MaximumConcurrency: !Ref ProcessorMaxConcurrency
+      Enabled: true
+
+  ReadCounterFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ReadCounterLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-read-counter"
+      Description: Le o total acumulado no DynamoDB (GetItem) e devolve JSON com Cache-Control.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt ReadCounterRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CounterTable
+          CACHE_TTL: !Ref CountCacheTtlSeconds
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+
+          import boto3
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["TABLE_NAME"]
+          TTL = os.environ.get("CACHE_TTL", "5")
+
+
+          def handler(event, context):
+              try:
+                  item = ddb.get_item(TableName=TABLE, Key={"id": {"S": "hits"}}).get("Item", {})
+                  count = int(item.get("hit_count", {}).get("N", "0"))
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json",
+                          "Cache-Control": "public, max-age=" + TTL,
+                      },
+                      "body": json.dumps({"count": count}),
+                  }
+              except Exception:
+                  log.exception("Falha ao ler o contador")
+                  return {
+                      "statusCode": 500,
+                      "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"},
+                      "body": json.dumps({"message": "indisponivel"}),
+                  }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  ReadCounterInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ReadCounterFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/GET/api/count"
+
+  # ===================================================================================================================
+  # 4. API GATEWAY REST - POST /api/hits (integracao direta ao SQS) e GET /api/count (Lambda proxy)
+  #    Toda rota exige API key; o CloudFront envia a chave em x-api-key (correcao do bypass do WAF).
+  # ===================================================================================================================
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/${Environment}/origin-verify-key"
+      Description: Chave compartilhada entre CloudFront (cabecalho x-api-key) e API Gateway (API key).
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiToSqsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: api-gateway-send-message-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "sqs:SendMessage"
+                Resource: !GetAtt ClickQueue.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-api"
+      Description: API do contador de acessos (escrita via SQS, leitura via Lambda).
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      # O endereco execute-api precisa ficar habilitado porque e a origem do CloudFront; o acesso direto e barrado pela API key.
+      DisableExecuteApiEndpoint: false
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+
+  HitsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: hits
+
+  CountResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResource
+      PathPart: count
+
+  HitsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HitsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${ClickQueue.QueueName}"
+        Credentials: !GetAtt ApiToSqsRole.Arn
+        PassthroughBehavior: NEVER
+        RequestParameters:
+          integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+        # Corpo fixo: o conteudo enviado pelo navegador e ignorado (o cliente nao injeta dados na fila).
+        RequestTemplates:
+          "application/json": "Action=SendMessage&MessageBody=hit"
+        IntegrationResponses:
+          - StatusCode: "202"
+            ResponseTemplates:
+              "application/json": '{"status":"accepted"}'
+          - StatusCode: "502"
+            SelectionPattern: '[45]\d{2}'
+            ResponseTemplates:
+              "application/json": '{"message":"nao foi possivel registrar"}'
+      MethodResponses:
+        - StatusCode: "202"
+          ResponseModels: { "application/json": Empty }
+        - StatusCode: "502"
+          ResponseModels: { "application/json": Empty }
+
+  CountGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref CountResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ReadCounterFunction.Arn}/invocations"
+
+  # Ao mudar recursos/metodos, renomear este logical ID (ver observacoes no cabecalho).
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [HitsPostMethod, CountGetMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+      Description: Implantacao inicial (POST /api/hits e GET /api/count)
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ApiLogsEnabled
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-${Environment}-access"
+      RetentionInDays: !Ref LogRetentionDays
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref ApiStageName
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          ThrottlingRateLimit: !Ref ApiThrottleRate
+          ThrottlingBurstLimit: !Ref ApiThrottleBurst
+      AccessLogSetting: !If
+        - ApiLogsEnabled
+        - DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+          Format: '{"requestId":"$context.requestId","method":"$context.httpMethod","path":"$context.path","status":"$context.status","latencyMs":"$context.responseLatency"}'
+        - !Ref "AWS::NoValue"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Description: Chave de origem (enviada apenas pelo CloudFront).
+      Enabled: true
+      Value: !Sub "{{resolve:secretsmanager:${OriginVerifySecret}:SecretString:::${OriginVerifySecretVersionId}}}"
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-${Environment}-usage-plan"
+      Description: Throttling global da API (todo o trafego legitimo usa a mesma chave).
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref ApiStage
+      Throttle:
+        RateLimit: !Ref ApiThrottleRate
+        BurstLimit: !Ref ApiThrottleBurst
+
+  ApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ApiUsagePlan
+
+  # ===================================================================================================================
+  # 5. SITE ESTATICO - S3 privado (OAC, versionamento, criptografia, bloqueio de acesso publico)
+  # ===================================================================================================================
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-site-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: "s3:GetObject"
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: AllowCloudFrontList
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: "s3:ListBucket"
+            Resource: !GetAtt SiteBucket.Arn
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # ===================================================================================================================
+  # 6. BORDA - ACM, WAF, CloudFront, Route 53
+  # ===================================================================================================================
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-web-acl"
+      Description: Web ACL unica do CloudFront (site e API). Comece em modo Count e mude para Block apos revisar as amostras.
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !Sub "${ProjectName}-${Environment}-web-acl"
+      Rules:
+        - Name: RateLimitApiPerIp
+          Priority: 0
+          Action: !If [WafBlock, { Block: {} }, { Count: {} }]
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref ApiRateLimitPer5Min
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: /api/
+                  PositionalConstraint: STARTS_WITH
+                  FieldToMatch: { UriPath: {} }
+                  TextTransformations:
+                    - { Priority: 0, Type: NONE }
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: RateLimitApiPerIp
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction: !If [WafBlock, { None: {} }, { Count: {} }]
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-${Environment}-site-oac"
+        Description: Acesso do CloudFront ao bucket privado do site.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CountCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${ProjectName}-${Environment}-count-cache"
+        Comment: Cache curto de GET /api/count (defasagem maxima = TTL).
+        MinTTL: 0
+        DefaultTTL: !Ref CountCacheTtlSeconds
+        MaxTTL: !Ref CountCacheTtlSeconds
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig: { HeaderBehavior: none }
+          CookiesConfig: { CookieBehavior: none }
+          QueryStringsConfig: { QueryStringBehavior: none }
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub "${ProjectName}-${Environment}-security-headers"
+        Comment: Cabecalhos de seguranca. Ajuste a CSP quando o site real for publicado.
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: false
+            Preload: false
+            Override: true
+          ContentTypeOptions: { Override: true }
+          FrameOptions: { FrameOption: DENY, Override: true }
+          ReferrerPolicy: { ReferrerPolicy: strict-origin-when-cross-origin, Override: true }
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
+            Override: true
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName}-${Environment} - site estatico + API"
+        Enabled: true
+        Aliases: [!Ref DomainName]
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref CloudFrontPriceClass
+        WebACLId: !GetAtt WebAcl.Arn
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: SiteS3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+          - Id: ApiGatewayOrigin
+            DomainName: !Sub "${RestApi}.execute-api.${AWS::Region}.amazonaws.com"
+            OriginPath: !Sub "/${ApiStageName}"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+            OriginCustomHeaders:
+              - HeaderName: x-api-key
+                HeaderValue: !Sub "{{resolve:secretsmanager:${OriginVerifySecret}:SecretString:::${OriginVerifySecretVersionId}}}"
+        DefaultCacheBehavior:
+          TargetOriginId: SiteS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+        CacheBehaviors:
+          - PathPattern: /api/hits
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: false
+            # Managed-CachingDisabled (escrita nunca e cacheada)
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          - PathPattern: /api/count
+            TargetOriginId: ApiGatewayOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: !Ref CountCachePolicy
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ManagedBy, Value: CloudFormation }
+
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Comment: Alias do dominio para o CloudFront.
+      RecordSets:
+        - Name: !Ref DomainName
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+            EvaluateTargetHealth: false
+        - Name: !Ref DomainName
+          Type: AAAA
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+            EvaluateTargetHealth: false
+
+  # ===================================================================================================================
+  # 7. PAGINA DE DEMONSTRACAO (opcional) - grava index.html no bucket e invalida o cache.
+  #    O site real deve ser publicado por pipeline (aws s3 sync). Desligue com PublishPlaceholderSite=false.
+  # ===================================================================================================================
+  SitePublisherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: PublishPlaceholder
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-${Environment}-site-publisher"
+      RetentionInDays: !Ref LogRetentionDays
+
+  SitePublisherRole:
+    Type: AWS::IAM::Role
+    Condition: PublishPlaceholder
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: site-publisher-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !GetAtt SitePublisherLogGroup.Arn
+              - Effect: Allow
+                Action: "s3:PutObject"
+                Resource: !Sub "${SiteBucket.Arn}/*"
+              - Effect: Allow
+                Action: "cloudfront:CreateInvalidation"
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  SitePublisherFunction:
+    Type: AWS::Lambda::Function
+    Condition: PublishPlaceholder
+    DependsOn: SitePublisherLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-site-publisher"
+      Description: Recurso customizado que publica a pagina de demonstracao no bucket do site.
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt SitePublisherRole.Arn
+      Code:
+        ZipFile: |
+          import time
+
+          import boto3
+          import cfnresponse
+
+          HTML = '''<!doctype html>
+          <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Em Breve</title>
+          <style>body{font-family:system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#e2e8f0;text-align:center}
+          main{padding:2rem}button{font-size:1rem;padding:.8rem 1.6rem;border:0;border-radius:.5rem;background:#ff9900;color:#111;cursor:pointer}
+          #c{font-size:3rem;margin:.5rem 0}</style></head>
+          <body><main><h1>Em Breve</h1><p>Total de interessados</p><div id="c">-</div>
+          <button id="b">Tenho interesse</button><p id="m"></p></main>
+          <script>
+          const c=document.getElementById('c'),m=document.getElementById('m'),b=document.getElementById('b');
+          async function load(){try{const r=await fetch('/api/count');if(!r.ok)throw 0;const j=await r.json();c.textContent=j.count}
+          catch(e){m.textContent='Total indisponivel no momento.'}}
+          b.onclick=async()=>{b.disabled=true;try{const r=await fetch('/api/hits',{method:'POST'});if(!r.ok)throw 0;
+          m.textContent='Obrigado! Seu interesse foi registrado.';c.textContent=(Number(c.textContent)||0)+1}
+          catch(e){m.textContent='Nao foi possivel registrar agora. Tente novamente.';b.disabled=false}};
+          load();
+          </script></body></html>'''
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      props = event["ResourceProperties"]
+                      boto3.client("s3").put_object(
+                          Bucket=props["Bucket"], Key="index.html", Body=HTML.encode("utf-8"),
+                          ContentType="text/html; charset=utf-8", CacheControl="no-cache",
+                      )
+                      try:
+                          boto3.client("cloudfront").create_invalidation(
+                              DistributionId=props["DistributionId"],
+                              InvalidationBatch={"Paths": {"Quantity": 1, "Items": ["/index.html"]},
+                                                 "CallerReference": str(time.time())},
+                          )
+                      except Exception as exc:  # a invalidacao nao deve derrubar a stack
+                          print("Invalidacao ignorada:", exc)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as exc:
+                  print("Erro:", exc)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(exc)})
+
+  SitePublisher:
+    Type: Custom::SitePublisher
+    Condition: PublishPlaceholder
+    DependsOn: [SiteBucketPolicy, DnsRecords]
+    Properties:
+      ServiceToken: !GetAtt SitePublisherFunction.Arn
+      Bucket: !Ref SiteBucket
+      DistributionId: !Ref Distribution
+      Version: !Ref SiteVersion
+
+  # ===================================================================================================================
+  # 8. OBSERVABILIDADE E CUSTO - SNS, alarmes do CloudWatch, AWS Budgets
+  # ===================================================================================================================
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-alerts"
+      DisplayName: !Sub "${ProjectName} ${Environment} alertas"
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: "sns:Publish"
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+          - Sid: AllowBudgets
+            Effect: Allow
+            Principal: { Service: budgets.amazonaws.com }
+            Action: "sns:Publish"
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" }
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "sns:Publish"
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  DlqNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-dlq-not-empty"
+      AlarmDescription: Ha mensagens na Dead Letter Queue (cliques que falharam 3 vezes).
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt ClickDeadLetterQueue.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  QueueAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-queue-oldest-message-age"
+      AlarmDescription: A mensagem mais antiga da fila principal esta parada ha mais de 10 minutos (processamento travado).
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt ClickQueue.QueueName }
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  ProcessorErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-counter-processor-errors"
+      AlarmDescription: Erros no Lambda Counter Processor.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ProcessorFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  ReadCounterErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-read-counter-errors"
+      AlarmDescription: Erros no Lambda Read Counter.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref ReadCounterFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-api-5xx"
+      AlarmDescription: Respostas 5XX do API Gateway.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub "${ProjectName}-${Environment}-api" }
+        - { Name: Stage, Value: !Ref ApiStageName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+    DependsOn: ApiStage
+
+  CloudFront5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-cloudfront-5xx-rate"
+      AlarmDescription: Taxa de erros 5xx do CloudFront acima de 5% por 10 minutos.
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - { Name: DistributionId, Value: !Ref Distribution }
+        - { Name: Region, Value: Global }
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: AlertTopicPolicy
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${Environment}-monthly-cost"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: SNS, Address: !Ref AlertTopic }
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+        - Notification:
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - { SubscriptionType: SNS, Address: !Ref AlertTopic }
+            - { SubscriptionType: EMAIL, Address: !Ref AlertEmail }
+
+  # ===================================================================================================================
+  # 9. AUDITORIA - CloudTrail com destino em S3 criptografado e ciclo de vida
+  # ===================================================================================================================
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateTrail
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-trail-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTrailLogs
+            Status: Enabled
+            ExpirationInDays: !Ref TrailLogRetentionDays
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateTrail
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "s3:GetBucketAcl"
+            Resource: !GetAtt TrailBucket.Arn
+            Condition:
+              StringEquals:
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${Environment}-trail"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": bucket-owner-full-control
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-${Environment}-trail"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt TrailBucket.Arn, !Sub "${TrailBucket.Arn}/*"]
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    Condition: CreateTrail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-${Environment}-trail"
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref Environment }
+
+Outputs:
+  SiteUrl:
+    Description: URL publica do site e da API (/api/hits e /api/count).
+    Value: !Sub "https://${DomainName}"
+  DistributionId:
+    Description: ID da distribuicao CloudFront (usado em invalidacoes).
+    Value: !Ref Distribution
+    Export: { Name: !Sub "${AWS::StackName}-DistributionId" }
+  DistributionDomainName:
+    Description: Dominio padrao do CloudFront (tambem protegido pelo WAF).
+    Value: !GetAtt Distribution.DomainName
+  SiteBucketName:
+    Description: Bucket privado do site (publicar com aws s3 sync).
+    Value: !Ref SiteBucket
+    Export: { Name: !Sub "${AWS::StackName}-SiteBucketName" }
+  WebAclArn:
+    Description: ARN da Web ACL do WAF.
+    Value: !GetAtt WebAcl.Arn
+  ApiId:
+    Description: ID do REST API.
+    Value: !Ref RestApi
+  ApiDirectUrl:
+    Description: Endereco direto execute-api (apenas para o teste de bypass - deve retornar 403 sem a chave).
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/api/hits"
+  ValidationCommands:
+    Description: Plano de validacao do bypass (nao executado automaticamente).
+    Value: !Sub "curl -i -X POST https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}/api/hits  # esperado 403 ;  curl -i -X POST https://${DomainName}/api/hits  # esperado 202"
+  ClickQueueUrl:
+    Description: URL da fila Click Buffer.
+    Value: !Ref ClickQueue
+  ClickDeadLetterQueueUrl:
+    Description: URL da Dead Letter Queue.
+    Value: !Ref ClickDeadLetterQueue
+  CounterTableName:
+    Description: Tabela DynamoDB do contador.
+    Value: !Ref CounterTable
+  AlertTopicArn:
+    Description: Topico SNS de alertas (confirme a assinatura do e-mail).
+    Value: !Ref AlertTopic
+  OriginVerifySecretArn:
+    Description: Segredo com a chave de origem (x-api-key).
+    Value: !Ref OriginVerifySecret
