@@ -1,0 +1,20 @@
+# Sistema operacional
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*~
+
+# Credenciais e variáveis locais (nunca versionar)
+.env
+.env.*
+*.pem
+.aws/
+
+# Artefatos locais
+*.zip
+*.log
