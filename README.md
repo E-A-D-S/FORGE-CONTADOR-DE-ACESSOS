@@ -443,7 +443,7 @@ Os nomes abaixo usam os valores padrão `ProjectName=access-counter` e `Environm
 
 ## 12. Implantação passo a passo
 
-> **Status:** o template ainda não foi implantado nem testado em uma conta real. Valide primeiro em uma conta ou ambiente de teste.
+> **Status:** o template passa no validador `cfn-lint` sem erros, mas ainda não foi implantado nem testado em uma conta real. Implante primeiro em uma conta ou ambiente de teste.
 
 ### 12.1 Pré-requisitos
 
@@ -479,7 +479,7 @@ export ZONA=Z0123456789ABC                    # cole aqui o ID retornado
 
 ### 12.4 Criar o bucket de artefatos
 
-O template tem cerca de 53 KB, acima do limite de 51.200 bytes que a AWS CLI aceita para enviar um template diretamente. Por isso, ele precisa passar por um bucket S3 na validação e no deploy:
+O template tem cerca de 54 KB, acima do limite de 51.200 bytes que a AWS CLI aceita para enviar um template diretamente. Por isso, ele precisa passar por um bucket S3 na validação e no deploy:
 
 ```bash
 export ARTEFATOS=access-counter-cfn-$CONTA
@@ -668,7 +668,7 @@ Preferimos deixar claro o que a solução **não** faz:
 | **Alterações na API exigem renomear `ApiDeployment`** | Documentado na seção 13 |
 | **IPs em logs** do WAF e do CloudFront, se ativados | Retenção curta e finalidade definida, pensando na LGPD |
 | **O site não tem lógica de servidor** | Qualquer dinamismo vai para a API |
-| **Template ainda não testado em conta real** | Validar com `cfn-lint` e implantar primeiro em ambiente de teste |
+| **Template ainda não testado em conta real** | Já passa no `cfn-lint` sem erros. Falta implantar em um ambiente de teste e executar o checklist da seção 12 |
 
 ## 15. Roteiro e status
 
@@ -681,7 +681,7 @@ Preferimos deixar claro o que a solução **não** faz:
 | **4. CI/CD** | Pipeline com testes e aprovação manual, branch protegida | Um push na `main` só chega à produção com aprovação | Planejada |
 | **5. Endurecimento e go-live** | Teste de carga, revisão do IAM, runbook da DLQ, WAF em modo bloqueio, escolha do plano do CloudFront | Uma semana sem alarmes inesperados e custo dentro do previsto | Planejada |
 
-**Status atual:** arquitetura definida e documentada, custos estimados na AWS Pricing Calculator e template CloudFormation escrito. O template ainda não foi implantado nem testado em conta real.
+**Status atual:** arquitetura definida e documentada, custos estimados na AWS Pricing Calculator e template CloudFormation escrito e validado com `cfn-lint` (sem erros). O template ainda não foi implantado nem testado em conta real.
 
 ## 16. Estrutura do repositório
 

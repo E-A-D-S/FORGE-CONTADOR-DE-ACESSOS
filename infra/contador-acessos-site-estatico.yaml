@@ -12,12 +12,18 @@ Description: >-
 # PRE-REQUISITOS: (1) zona hospedada PUBLICA do dominio no Route 53 (informe o HostedZoneId);
 #                 (2) e-mail para alertas; (3) permissoes para criar IAM roles (CAPABILITY_IAM).
 #
-# VALIDAR ...: aws cloudformation validate-template --template-body file://contador-acessos-site-estatico.yaml
-#              cfn-lint contador-acessos-site-estatico.yaml
+# TAMANHO ...: este template tem mais de 51.200 bytes, o limite para envio direto pela AWS CLI. Por isso a validacao
+#              pela AWS e o deploy passam por um bucket S3 de artefatos (crie uma vez: aws s3 mb s3://<bucket-de-artefatos>).
+#
+# VALIDAR ...: cfn-lint contador-acessos-site-estatico.yaml
+#              aws s3 cp contador-acessos-site-estatico.yaml s3://<bucket-de-artefatos>/contador-acessos-site-estatico.yaml
+#              aws cloudformation validate-template \
+#                --template-url https://<bucket-de-artefatos>.s3.amazonaws.com/contador-acessos-site-estatico.yaml
 #
 # DEPLOY ....: aws cloudformation deploy --region us-east-1 \
 #                --stack-name access-counter-prod \
 #                --template-file contador-acessos-site-estatico.yaml \
+#                --s3-bucket <bucket-de-artefatos> \
 #                --capabilities CAPABILITY_IAM \
 #                --parameter-overrides DomainName=contador.exemplo.com.br HostedZoneId=Z0123456789ABC \
 #                                      AlertEmail=equipe@exemplo.com.br Environment=prod \
@@ -735,7 +741,7 @@ Resources:
     Type: AWS::WAFv2::WebACL
     Properties:
       Name: !Sub "${ProjectName}-${Environment}-web-acl"
-      Description: Web ACL unica do CloudFront (site e API). Comece em modo Count e mude para Block apos revisar as amostras.
+      Description: Web ACL unica do CloudFront para site e API. Comece em modo Count e mude para Block apos revisar as amostras.
       Scope: CLOUDFRONT
       DefaultAction: { Allow: {} }
       VisibilityConfig:
